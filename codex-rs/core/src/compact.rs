@@ -7,6 +7,8 @@ use crate::client_common::ResponseEvent;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::codex::get_last_assistant_message_from_turn;
+use crate::context_manager::ContextManager;
+use crate::context_manager::estimate_item_token_count;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;
@@ -34,6 +36,13 @@ pub const SUMMARIZATION_PROMPT: &str = include_str!("../templates/compact/prompt
 pub const SUMMARY_PREFIX: &str = include_str!("../templates/compact/summary_prefix.md");
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
+/// Fraction of history (by tokens) to compact during auto-compaction.
+/// The remaining (1 - fraction) is kept verbatim.
+pub(crate) const COMPACT_SPLIT_FRACTION: f64 = 0.5;
+
+/// Minimum token count in the old half before compaction is worthwhile.
+const COMPACT_MIN_OLD_HALF_TOKENS: i64 = 1_000;
+
 pub(crate) fn should_use_remote_compact_task(
     session: &Session,
     provider: &ModelProviderInfo,
@@ -52,7 +61,168 @@ pub(crate) async fn run_inline_auto_compact_task(
         text_elements: Vec::new(),
     }];
 
-    run_compact_task_inner(sess, turn_context, input).await;
+    run_partial_compact_task_inner(sess, turn_context, input).await;
+}
+
+/// Partial compaction: only summarize the older half of history,
+/// keeping the recent half verbatim.
+async fn run_partial_compact_task_inner(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    input: Vec<UserInput>,
+) {
+    let full_history = sess.clone_history().await;
+    let all_items = full_history.raw_items().to_vec();
+
+    // Try to split; if old half is too small, fall back to full compaction.
+    let Some((old_half, recent_half)) =
+        split_history_at_token_midpoint(&all_items, COMPACT_SPLIT_FRACTION)
+    else {
+        run_compact_task_inner(sess, turn_context, input).await;
+        return;
+    };
+
+    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    sess.emit_turn_item_started(&turn_context, &compaction_item)
+        .await;
+
+    // Build a temporary history containing only the old half + summarization prompt.
+    let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
+    let mut compact_history = ContextManager::new();
+    compact_history.replace(old_half.clone());
+    compact_history.record_items(
+        &[initial_input_for_turn.into()],
+        turn_context.truncation_policy,
+    );
+
+    let mut truncated_count = 0usize;
+    let max_retries = turn_context.provider.stream_max_retries();
+    let mut retries = 0;
+    let turn_metadata_header = turn_context.resolve_turn_metadata_header().await;
+    let mut client_session = sess.services.model_client.new_session();
+
+    let collaboration_mode = sess.current_collaboration_mode().await;
+    let rollout_item = RolloutItem::TurnContext(TurnContextItem {
+        cwd: turn_context.cwd.clone(),
+        approval_policy: turn_context.approval_policy,
+        sandbox_policy: turn_context.sandbox_policy.clone(),
+        model: turn_context.model_info.slug.clone(),
+        personality: turn_context.personality,
+        collaboration_mode: Some(collaboration_mode),
+        effort: turn_context.reasoning_effort,
+        summary: turn_context.reasoning_summary,
+        user_instructions: turn_context.user_instructions.clone(),
+        developer_instructions: turn_context.developer_instructions.clone(),
+        final_output_json_schema: turn_context.final_output_json_schema.clone(),
+        truncation_policy: Some(turn_context.truncation_policy.into()),
+    });
+    sess.persist_rollout_items(&[rollout_item]).await;
+
+    loop {
+        let turn_input = compact_history.clone().for_prompt();
+        let turn_input_len = turn_input.len();
+        let prompt = Prompt {
+            input: turn_input,
+            base_instructions: sess.get_base_instructions().await,
+            personality: turn_context.personality,
+            ..Default::default()
+        };
+        let attempt_result = drain_to_completed(
+            &sess,
+            turn_context.as_ref(),
+            &mut client_session,
+            turn_metadata_header.as_deref(),
+            &prompt,
+        )
+        .await;
+
+        match attempt_result {
+            Ok(()) => {
+                if truncated_count > 0 {
+                    sess.notify_background_event(
+                        turn_context.as_ref(),
+                        format!(
+                            "Trimmed {truncated_count} older thread item(s) before compacting so the prompt fits the model context window."
+                        ),
+                    )
+                    .await;
+                }
+                break;
+            }
+            Err(CodexErr::Interrupted) => {
+                return;
+            }
+            Err(e @ CodexErr::ContextWindowExceeded) => {
+                if turn_input_len > 1 {
+                    error!(
+                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
+                    );
+                    compact_history.remove_first_item();
+                    truncated_count += 1;
+                    retries = 0;
+                    continue;
+                }
+                sess.set_total_tokens_full(turn_context.as_ref()).await;
+                let event = EventMsg::Error(e.to_error_event(None));
+                sess.send_event(&turn_context, event).await;
+                return;
+            }
+            Err(e) => {
+                if retries < max_retries {
+                    retries += 1;
+                    let delay = backoff(retries);
+                    sess.notify_stream_error(
+                        turn_context.as_ref(),
+                        format!("Reconnecting... {retries}/{max_retries}"),
+                        e,
+                    )
+                    .await;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                } else {
+                    let event = EventMsg::Error(e.to_error_event(None));
+                    sess.send_event(&turn_context, event).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    // The model's summary is recorded in the session history via drain_to_completed.
+    // Extract it from there.
+    let history_snapshot = sess.clone_history().await;
+    let history_items = history_snapshot.raw_items();
+    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+
+    let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
+
+    // Collect ghost snapshots from the old half (recent half's ghosts are already in recent_half).
+    let ghost_snapshots: Vec<ResponseItem> = old_half
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
+
+    let mut new_history =
+        build_partial_compacted_history(initial_context, &summary_text, recent_half);
+    new_history.extend(ghost_snapshots);
+
+    sess.replace_history(new_history).await;
+    sess.recompute_token_usage(&turn_context).await;
+
+    let rollout_item = RolloutItem::Compacted(CompactedItem {
+        message: summary_text.clone(),
+        replacement_history: None,
+    });
+    sess.persist_rollout_items(&[rollout_item]).await;
+
+    sess.emit_turn_item_completed(&turn_context, compaction_item)
+        .await;
+    let warning = EventMsg::Warning(WarningEvent {
+        message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+    });
+    sess.send_event(&turn_context, warning).await;
 }
 
 pub(crate) async fn run_compact_task(
@@ -274,6 +444,122 @@ fn collect_turn_aborted_marker(item: &ResponseItem) -> Option<String> {
 
 pub(crate) fn is_summary_message(message: &str) -> bool {
     message.starts_with(format!("{SUMMARY_PREFIX}\n").as_str())
+}
+
+/// Returns true if the item is a call that expects a corresponding output.
+fn is_call_item(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::FunctionCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::LocalShellCall { .. }
+    )
+}
+
+/// Returns true if the item is an output that corresponds to a call.
+fn is_output_item(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+    )
+}
+
+/// Split history items into (old_half, recent_half) by cumulative token count.
+///
+/// The split targets `split_fraction` of total tokens in the old half.
+/// The boundary is adjusted so call/output pairs are never split across halves.
+///
+/// Returns `None` if the old half would have fewer than
+/// `COMPACT_MIN_OLD_HALF_TOKENS` tokens (not worth compacting).
+pub(crate) fn split_history_at_token_midpoint(
+    items: &[ResponseItem],
+    split_fraction: f64,
+) -> Option<(Vec<ResponseItem>, Vec<ResponseItem>)> {
+    if items.is_empty() {
+        return None;
+    }
+
+    let total_tokens: i64 = items.iter().map(|i| estimate_item_token_count(i)).sum();
+    let target_tokens = (total_tokens as f64 * split_fraction) as i64;
+
+    if target_tokens < COMPACT_MIN_OLD_HALF_TOKENS {
+        return None;
+    }
+
+    // Walk forward to find the candidate split index.
+    let mut accumulated: i64 = 0;
+    let mut split_idx = items.len(); // default: everything in old half
+    for (i, item) in items.iter().enumerate() {
+        accumulated += estimate_item_token_count(item);
+        if accumulated >= target_tokens {
+            split_idx = i + 1; // split after this item
+            break;
+        }
+    }
+
+    // Adjust for call/output pair boundaries.
+    // If the last item in old_half is a call without its output, move it to recent_half.
+    if split_idx > 0 && split_idx < items.len() {
+        let last_in_old = &items[split_idx - 1];
+        if is_call_item(last_in_old) {
+            // The output would be in recent_half — move the call there too.
+            split_idx -= 1;
+        }
+    }
+    // If the first item in recent_half is an output without its call, move it to old_half.
+    if split_idx < items.len() {
+        let first_in_recent = &items[split_idx];
+        if is_output_item(first_in_recent) {
+            // The call is in old_half — move the output there too.
+            split_idx += 1;
+        }
+    }
+
+    // Clamp to valid range.
+    split_idx = split_idx.clamp(0, items.len());
+
+    // Re-check old half is still meaningful.
+    let old_half_tokens: i64 = items[..split_idx]
+        .iter()
+        .map(|i| estimate_item_token_count(i))
+        .sum();
+    if old_half_tokens < COMPACT_MIN_OLD_HALF_TOKENS {
+        return None;
+    }
+
+    // Don't compact if there's nothing left in the recent half.
+    if split_idx >= items.len() {
+        return None;
+    }
+
+    Some((items[..split_idx].to_vec(), items[split_idx..].to_vec()))
+}
+
+/// Build a new history for partial compaction:
+/// initial_context + summary_as_user_message + recent_half (verbatim).
+fn build_partial_compacted_history(
+    mut history: Vec<ResponseItem>,
+    summary_text: &str,
+    recent_half: Vec<ResponseItem>,
+) -> Vec<ResponseItem> {
+    let summary_text = if summary_text.is_empty() {
+        "(no summary available)".to_string()
+    } else {
+        summary_text.to_string()
+    };
+
+    history.push(ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText { text: summary_text }],
+        end_turn: None,
+        phase: None,
+    });
+
+    // Append the recent half verbatim — all item types preserved.
+    history.extend(recent_half);
+
+    history
 }
 
 pub(crate) fn build_compacted_history(
