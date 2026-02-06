@@ -193,6 +193,9 @@
             "memory_tool": {
               "type": "boolean"
             },
+            "partial_compaction": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
@@ -1224,6 +1227,9 @@
           "type": "boolean"
         },
         "memory_tool": {
+          "type": "boolean"
+        },
+        "partial_compaction": {
           "type": "boolean"
         },
         "personality": {

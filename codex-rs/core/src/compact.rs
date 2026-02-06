@@ -502,21 +502,17 @@ pub(crate) fn split_history_at_token_midpoint(
     }
 
     // Adjust for call/output pair boundaries.
-    // If the last item in old_half is a call without its output, move it to recent_half.
-    if split_idx > 0 && split_idx < items.len() {
-        let last_in_old = &items[split_idx - 1];
-        if is_call_item(last_in_old) {
-            // The output would be in recent_half — move the call there too.
-            split_idx -= 1;
-        }
+    // Move all consecutive trailing calls from old_half into recent_half
+    // (handles parallel tool calls like [Call_A, Call_B] that would be
+    // orphaned from their outputs).
+    while split_idx > 0 && is_call_item(&items[split_idx - 1]) {
+        split_idx -= 1;
     }
-    // If the first item in recent_half is an output without its call, move it to old_half.
-    if split_idx < items.len() {
-        let first_in_recent = &items[split_idx];
-        if is_output_item(first_in_recent) {
-            // The call is in old_half — move the output there too.
-            split_idx += 1;
-        }
+    // Move all consecutive leading outputs from recent_half into old_half
+    // (handles parallel outputs like [Output_A, Output_B] that would be
+    // orphaned from their calls).
+    while split_idx < items.len() && is_output_item(&items[split_idx]) {
+        split_idx += 1;
     }
 
     // Clamp to valid range.
@@ -847,6 +843,97 @@ mod tests {
             other => panic!("expected summary message, found {other:?}"),
         };
         assert_eq!(summary, summary_text);
+    }
+
+    /// Reproduce the parallel tool call boundary bug: with items
+    /// [Msg, Call_A, Call_B, Output_A, Output_B], the split must not
+    /// orphan Call_A in old_half while its Output_A lands in recent_half.
+    #[test]
+    fn split_does_not_orphan_parallel_tool_calls() {
+        use codex_protocol::models::{FunctionCallOutputBody, FunctionCallOutputPayload};
+
+        let user_msg = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "x".repeat(4000), // ~1000 tokens
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let call_a = ResponseItem::FunctionCall {
+            id: None,
+            name: "tool_a".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call_a".to_string(),
+        };
+        let call_b = ResponseItem::FunctionCall {
+            id: None,
+            name: "tool_b".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call_b".to_string(),
+        };
+        let output_a = ResponseItem::FunctionCallOutput {
+            call_id: "call_a".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("result_a".to_string()),
+                success: Some(true),
+            },
+        };
+        let output_b = ResponseItem::FunctionCallOutput {
+            call_id: "call_b".to_string(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("result_b".to_string()),
+                success: Some(true),
+            },
+        };
+
+        let items = vec![
+            user_msg,
+            call_a,
+            call_b,
+            output_a,
+            output_b,
+        ];
+
+        // Compute per-item token counts and pick a fraction that forces
+        // the split right after Call_B (index 2), i.e. split_idx = 3.
+        let token_counts: Vec<i64> =
+            items.iter().map(|i| estimate_item_token_count(i)).collect();
+        let total: i64 = token_counts.iter().sum();
+        let after_call_b: i64 = token_counts[..3].iter().sum();
+
+        // fraction such that target = after_call_b, so accumulated hits
+        // target exactly when Call_B is processed.
+        let fraction = after_call_b as f64 / total as f64;
+
+        let result = split_history_at_token_midpoint(&items, fraction);
+        let (old, recent) = result.expect("should produce a split");
+
+        // Every call in old must have its output in old too.
+        for item in &old {
+            if let ResponseItem::FunctionCall { call_id, .. } = item {
+                assert!(
+                    old.iter().any(|o| matches!(
+                        o,
+                        ResponseItem::FunctionCallOutput { call_id: cid, .. } if cid == call_id
+                    )),
+                    "Call {call_id} is in old half but its output is missing from old half"
+                );
+            }
+        }
+        // Every output in recent must have its call in recent too.
+        for item in &recent {
+            if let ResponseItem::FunctionCallOutput { call_id, .. } = item {
+                assert!(
+                    recent.iter().any(|c| matches!(
+                        c,
+                        ResponseItem::FunctionCall { call_id: cid, .. } if cid == call_id
+                    )),
+                    "Output for {call_id} is in recent half but its call is missing from recent half"
+                );
+            }
+        }
     }
 
     #[test]
