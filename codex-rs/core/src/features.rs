@@ -131,6 +131,9 @@ pub enum Feature {
     Personality,
     /// Use the Responses API WebSocket transport for OpenAI by default.
     ResponsesWebsockets,
+    /// Partial compaction: only summarize the older half of history,
+    /// keeping the recent half verbatim.
+    PartialCompaction,
 }
 
 impl Feature {
@@ -583,6 +586,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ResponsesWebsockets,
         key: "responses_websockets",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::PartialCompaction,
+        key: "partial_compaction",
+        stage: Stage::Experimental {
+            name: "Partial compaction",
+            menu_description: "Only compact the older half of history, keeping recent context verbatim.",
+            announcement: "NEW: Partial compaction keeps your recent context intact. Enable in /experimental!",
+        },
         default_enabled: false,
     },
 ];

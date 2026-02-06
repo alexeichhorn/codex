@@ -8,6 +8,7 @@ use crate::compact::split_history_at_token_midpoint;
 use crate::context_manager::ContextManager;
 use crate::context_manager::is_codex_generated_item;
 use crate::error::Result as CodexResult;
+use crate::features::Feature;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
@@ -22,7 +23,11 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) {
-    run_partial_remote_compact_task_inner(&sess, &turn_context).await;
+    if sess.enabled(Feature::PartialCompaction) {
+        run_partial_remote_compact_task_inner(&sess, &turn_context).await;
+    } else {
+        run_remote_compact_task_inner(&sess, &turn_context).await;
+    }
 }
 
 pub(crate) async fn run_remote_compact_task(sess: Arc<Session>, turn_context: Arc<TurnContext>) {

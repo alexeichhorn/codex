@@ -61,7 +61,11 @@ pub(crate) async fn run_inline_auto_compact_task(
         text_elements: Vec::new(),
     }];
 
-    run_partial_compact_task_inner(sess, turn_context, input).await;
+    if sess.enabled(Feature::PartialCompaction) {
+        run_partial_compact_task_inner(sess, turn_context, input).await;
+    } else {
+        run_compact_task_inner(sess, turn_context, input).await;
+    }
 }
 
 /// Partial compaction: only summarize the older half of history,
