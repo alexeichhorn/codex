@@ -396,7 +396,9 @@ impl ModelClientSession {
             include,
             prompt_cache_key: Some(conversation_id.clone()),
             text,
-            store_override: None,
+            // Force persisted requests only in debug builds to aid compaction/input inspection.
+            // In release builds, do not override provider defaults.
+            store_override: cfg!(debug_assertions).then_some(true),
             conversation_id: Some(conversation_id),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: build_responses_headers(

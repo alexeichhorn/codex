@@ -2528,10 +2528,7 @@ async fn partial_auto_compact_preserves_recent_half_and_produces_summary() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
-    let request_bodies: Vec<String> = requests
-        .iter()
-        .map(|r| r.body_json().to_string())
-        .collect();
+    let request_bodies: Vec<String> = requests.iter().map(|r| r.body_json().to_string()).collect();
     assert_eq!(
         request_bodies.len(),
         4,

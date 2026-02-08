@@ -12,12 +12,15 @@ use crate::context_manager::estimate_item_token_count;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::features::Feature;
+use crate::instructions::SkillInstructions;
+use crate::instructions::UserInstructions;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::TurnContextItem;
 use crate::protocol::TurnStartedEvent;
 use crate::protocol::WarningEvent;
 use crate::session_prefix::TURN_ABORTED_OPEN_TAG;
+use crate::session_prefix::is_session_prefix;
 use crate::truncate::TruncationPolicy;
 use crate::truncate::approx_token_count;
 use crate::truncate::truncate_text;
@@ -468,6 +471,35 @@ fn is_output_item(item: &ResponseItem) -> bool {
     )
 }
 
+/// Returns true for history scaffolding that is re-injected via `build_initial_context`
+/// and should not influence partial-compaction midpoint selection.
+fn is_reinjected_scaffolding_item(item: &ResponseItem) -> bool {
+    let ResponseItem::Message { role, content, .. } = item else {
+        return false;
+    };
+
+    if role == "developer" {
+        return true;
+    }
+
+    if role != "user" {
+        return false;
+    }
+
+    if UserInstructions::is_user_instructions(content)
+        || SkillInstructions::is_skill_instructions(content)
+    {
+        return true;
+    }
+
+    content.iter().any(|entry| match entry {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            is_session_prefix(text)
+        }
+        ContentItem::InputImage { .. } => false,
+    })
+}
+
 /// Split history items into (old_half, recent_half) by cumulative token count.
 ///
 /// The split targets `split_fraction` of total tokens in the old half.
@@ -483,7 +515,19 @@ pub(crate) fn split_history_at_token_midpoint(
         return None;
     }
 
-    let total_tokens: i64 = items.iter().map(|i| estimate_item_token_count(i)).sum();
+    let split_eligible_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| (!is_reinjected_scaffolding_item(item)).then_some(idx))
+        .collect();
+    if split_eligible_indices.is_empty() {
+        return None;
+    }
+
+    let total_tokens: i64 = split_eligible_indices
+        .iter()
+        .map(|idx| estimate_item_token_count(&items[*idx]))
+        .sum();
     let target_tokens = (total_tokens as f64 * split_fraction) as i64;
 
     if target_tokens < COMPACT_MIN_OLD_HALF_TOKENS {
@@ -493,10 +537,10 @@ pub(crate) fn split_history_at_token_midpoint(
     // Walk forward to find the candidate split index.
     let mut accumulated: i64 = 0;
     let mut split_idx = items.len(); // default: everything in old half
-    for (i, item) in items.iter().enumerate() {
-        accumulated += estimate_item_token_count(item);
+    for idx in split_eligible_indices {
+        accumulated += estimate_item_token_count(&items[idx]);
         if accumulated >= target_tokens {
-            split_idx = i + 1; // split after this item
+            split_idx = idx + 1; // split after this item
             break;
         }
     }
@@ -521,6 +565,7 @@ pub(crate) fn split_history_at_token_midpoint(
     // Re-check old half is still meaningful.
     let old_half_tokens: i64 = items[..split_idx]
         .iter()
+        .filter(|item| !is_reinjected_scaffolding_item(item))
         .map(|i| estimate_item_token_count(i))
         .sum();
     if old_half_tokens < COMPACT_MIN_OLD_HALF_TOKENS {
@@ -850,7 +895,8 @@ mod tests {
     /// orphan Call_A in old_half while its Output_A lands in recent_half.
     #[test]
     fn split_does_not_orphan_parallel_tool_calls() {
-        use codex_protocol::models::{FunctionCallOutputBody, FunctionCallOutputPayload};
+        use codex_protocol::models::FunctionCallOutputBody;
+        use codex_protocol::models::FunctionCallOutputPayload;
 
         let user_msg = ResponseItem::Message {
             id: None,
@@ -888,18 +934,11 @@ mod tests {
             },
         };
 
-        let items = vec![
-            user_msg,
-            call_a,
-            call_b,
-            output_a,
-            output_b,
-        ];
+        let items = vec![user_msg, call_a, call_b, output_a, output_b];
 
         // Compute per-item token counts and pick a fraction that forces
         // the split right after Call_B (index 2), i.e. split_idx = 3.
-        let token_counts: Vec<i64> =
-            items.iter().map(|i| estimate_item_token_count(i)).collect();
+        let token_counts: Vec<i64> = items.iter().map(|i| estimate_item_token_count(i)).collect();
         let total: i64 = token_counts.iter().sum();
         let after_call_b: i64 = token_counts[..3].iter().sum();
 
@@ -934,6 +973,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn split_ignores_reinjected_scaffolding_when_finding_midpoint() {
+        let user_instructions = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+                    "x".repeat(14_000)
+                ),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let env_context = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "<environment_context>\n<cwd>/tmp</cwd>\n<shell>zsh</shell>\n</environment_context>"
+                    .to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let older_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "u".repeat(8_000),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let older_assistant = ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "a".repeat(8_000),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let recent_user = ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "r".repeat(8_000),
+            }],
+            end_turn: None,
+            phase: None,
+        };
+        let items = vec![
+            user_instructions,
+            env_context,
+            older_user.clone(),
+            older_assistant,
+            recent_user.clone(),
+        ];
+
+        let (old_half, recent_half) = split_history_at_token_midpoint(&items, 0.5)
+            .expect("expected a split over compactable conversation items");
+
+        assert!(
+            old_half.contains(&older_user),
+            "midpoint should advance into conversational history, not stop inside reinjected scaffolding"
+        );
+        assert!(
+            recent_half.contains(&recent_user),
+            "recent conversational items should remain in the recent half"
+        );
+    }
+
+    #[test]
+    fn split_returns_none_when_only_reinjected_scaffolding_exists() {
+        let items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "policy".to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nDo X\n</INSTRUCTIONS>"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "<environment_context>\n<cwd>/tmp</cwd>\n<shell>zsh</shell>\n</environment_context>"
+                        .to_string(),
+                }],
+                end_turn: None,
+                phase: None,
+            },
+        ];
+
+        assert!(
+            split_history_at_token_midpoint(&items, 0.5).is_none(),
+            "scaffolding-only history should skip partial split and fall back to full compaction"
+        );
     }
 
     #[test]
