@@ -455,7 +455,7 @@ fn exec_options(
         label: "Yes, proceed".to_string(),
         decision: ApprovalDecision::Review(ReviewDecision::Approved),
         display_shortcut: None,
-        additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
+        additional_shortcuts: vec![],
     }]
     .into_iter()
     .chain(
@@ -477,7 +477,7 @@ fn exec_options(
                         },
                     ),
                     display_shortcut: None,
-                    additional_shortcuts: vec![key_hint::plain(KeyCode::Char('p'))],
+                    additional_shortcuts: vec![],
                 })
             }),
     )
@@ -485,7 +485,7 @@ fn exec_options(
         label: "No, and tell Codex what to do differently".to_string(),
         decision: ApprovalDecision::Review(ReviewDecision::Abort),
         display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
-        additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
+        additional_shortcuts: vec![],
     }])
     .collect()
 }
@@ -496,19 +496,19 @@ fn patch_options() -> Vec<ApprovalOption> {
             label: "Yes, proceed".to_string(),
             decision: ApprovalDecision::Review(ReviewDecision::Approved),
             display_shortcut: None,
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
+            additional_shortcuts: vec![],
         },
         ApprovalOption {
             label: "Yes, and don't ask again for these files".to_string(),
             decision: ApprovalDecision::Review(ReviewDecision::ApprovedForSession),
             display_shortcut: None,
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('a'))],
+            additional_shortcuts: vec![],
         },
         ApprovalOption {
             label: "No, and tell Codex what to do differently".to_string(),
             decision: ApprovalDecision::Review(ReviewDecision::Abort),
             display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
+            additional_shortcuts: vec![],
         },
     ]
 }
@@ -519,19 +519,19 @@ fn elicitation_options() -> Vec<ApprovalOption> {
             label: "Yes, provide the requested info".to_string(),
             decision: ApprovalDecision::McpElicitation(ElicitationAction::Accept),
             display_shortcut: None,
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
+            additional_shortcuts: vec![],
         },
         ApprovalOption {
             label: "No, but continue without it".to_string(),
             decision: ApprovalDecision::McpElicitation(ElicitationAction::Decline),
             display_shortcut: None,
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
+            additional_shortcuts: vec![],
         },
         ApprovalOption {
             label: "Cancel this request".to_string(),
             decision: ApprovalDecision::McpElicitation(ElicitationAction::Cancel),
             display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
-            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('c'))],
+            additional_shortcuts: vec![],
         },
     ]
 }
@@ -564,12 +564,13 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_triggers_selection() {
+    fn enter_triggers_selection() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut view = ApprovalOverlay::new(make_exec_request(), tx, Features::with_defaults());
         assert!(!view.is_complete());
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        // First option ("Yes, proceed") is selected by default, press Enter to confirm.
+        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         // We expect at least one CodexOp message in the queue.
         let mut saw_op = false;
         while let Ok(ev) = rx.try_recv() {
@@ -579,6 +580,17 @@ mod tests {
             }
         }
         assert!(saw_op, "expected approval decision to emit an op");
+    }
+
+    #[test]
+    fn single_char_keys_do_not_trigger_approval() {
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx);
+        let mut view = ApprovalOverlay::new(make_exec_request(), tx, Features::with_defaults());
+        assert!(!view.is_complete());
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(!view.is_complete(), "pressing 'y' should not approve");
+        assert!(rx.try_recv().is_err(), "no op should be emitted for single-char key");
     }
 
     #[test]
@@ -597,7 +609,9 @@ mod tests {
             tx,
             Features::with_defaults(),
         );
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        // Navigate down to the prefix option (index 1) and press Enter.
+        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let mut saw_op = false;
         while let Ok(ev) = rx.try_recv() {
             if let AppEvent::CodexOp(Op::ExecApproval { decision, .. }) = ev {
